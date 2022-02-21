@@ -4,24 +4,40 @@ import (
 	"fmt"
 	pb "gRPCnmap/proto"
 	"github.com/Ullaakut/nmap/v2"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/grpclog"
-	"log"
 	"net"
+	"os"
 	"strconv"
 	"time"
 )
+
+func init() {
+	lvl, ok := os.LookupEnv("LOG_LEVEL")
+	// LOG_LEVEL not set, let's default to debug
+	if !ok {
+		lvl = "debug"
+	}
+	// parse string, this is built-in feature of logrus
+	ll, err := logrus.ParseLevel(lvl)
+	if err != nil {
+		ll = logrus.DebugLevel
+	}
+	// set global log level
+	logrus.SetLevel(ll)
+}
+
+const listnerAdress = ":5300"
 
 const nmapScriptName = "vulners"
 const nmapScriptMinCvss = "7.0"
 
 func main() {
-	listener, err := net.Listen("tcp", ":5300")
-	log.Println("start listnening")
-
+	listener, err := net.Listen("tcp", listnerAdress)
+	logrus.Infof("Start TCP listner at %s", listnerAdress)
 	if err != nil {
-		grpclog.Fatalf("failed to listen: %v", err)
+		logrus.Errorf("Failed to listen: %v", err)
 	}
 
 	opts := []grpc.ServerOption{}
@@ -36,16 +52,19 @@ type server struct {
 }
 
 func (s *server) CheckVuln(c context.Context, request *pb.CheckVulnRequest) (response *pb.CheckVulnResponse, err error) {
-	checkTarget := request.Targets
-	check_port := request.TcpPorts
-	var ListPorts []string
-	for _, i := range check_port {
-		ListPorts = append(ListPorts, strconv.FormatInt(int64(i), 10))
-	}
-
-	fmt.Printf("targets is :%s\n %s", checkTarget, ListPorts)
-	response = NmapScanner(checkTarget, ListPorts)
+	Targets := request.Targets
+	Ports := Int32arrToStrArr(request.TcpPorts)
+	response = NmapScanner(Targets, Ports)
 	return response, nil
+}
+
+func Int32arrToStrArr(intArr []int32) []string {
+	var strList []string
+	for _, i := range intArr {
+		strList = append(strList, strconv.FormatInt(int64(i), 10))
+	}
+	logrus.Debugf("format []int32->[]string correct")
+	return strList
 }
 
 func NmapScanner(ListTargets []string, ListPorts []string) (NmapResponse *pb.CheckVulnResponse) {
@@ -54,7 +73,8 @@ func NmapScanner(ListTargets []string, ListPorts []string) (NmapResponse *pb.Che
 
 	scanner, err := nmap.NewScanner(
 		nmap.WithTargets(ListTargets...),
-		nmap.WithPorts(ListPorts...),
+		//nmap.WithPorts(ListPorts...),
+		nmap.WithMostCommonPorts(20),
 		nmap.WithConnectScan(), //tcp connect only
 		nmap.WithAggressiveScan(),
 		nmap.WithServiceInfo(),
@@ -64,24 +84,23 @@ func NmapScanner(ListTargets []string, ListPorts []string) (NmapResponse *pb.Che
 		nmap.WithContext(ctx),
 	)
 	if err != nil {
-		log.Fatalf("unable to create nmap scanner: %v", err)
+		logrus.Fatalf("Unable to create nmap scanner: %v", err)
 	}
 
+	logrus.Infof("Start Scanning hosts: %s ports %s", ListTargets, ListPorts)
 	result, _, err := scanner.Run()
 	if err != nil {
-		log.Fatalf("unable to run nmap scan: %v", err)
+		logrus.Fatalf("Unable to run nmap scan: %v", err)
 	}
-
-	log.Println("now")
+	logrus.Infof("Nmap done: %d hosts up scanned in %.2f seconds\n", len(result.Hosts), result.Stats.Finished.Elapsed)
+	logrus.Debugf("Start Packing to Response RPC")
+	start := time.Now()
 
 	TempResponse := &pb.CheckVulnResponse{}
 	for _, host := range result.Hosts {
 		if len(host.Ports) == 0 || len(host.Addresses) == 0 {
 			continue
 		}
-
-		fmt.Printf("Host %q:\n", host.Addresses[0])
-
 		for _, port := range host.Ports {
 
 			for _, script := range port.Scripts {
@@ -126,7 +145,10 @@ func NmapScanner(ListTargets []string, ListPorts []string) (NmapResponse *pb.Che
 				TempResponse.Results = append(TempResponse.Results, &TempResult)
 			}
 		}
-		fmt.Printf("Nmap done: %d hosts up scanned in %.2f seconds\n", len(result.Hosts), result.Stats.Finished.Elapsed)
+		t := time.Now()
+		elapsed := t.Sub(start)
+		diff := fmt.Sprintf("duration: %s", elapsed)
+		logrus.Debugf(diff)
 	}
 	return TempResponse
 }
